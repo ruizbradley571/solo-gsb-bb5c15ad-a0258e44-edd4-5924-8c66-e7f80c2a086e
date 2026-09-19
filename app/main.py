@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from .batch import validate_batch
+from .exposure import AuditParameterError, audit_exposure
 from .models import (
     BatchValidateRequest,
     BatchValidateResponse,
+    ExposureAuditRequest,
+    ExposureAuditResponse,
     ReconcileRequest,
     ReconcileResponse,
     ValidateRequest,
@@ -18,7 +22,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -61,3 +65,20 @@ def reconcile_validate(request: ReconcileRequest) -> ReconcileResponse:
     （报告多头 / 缺失前驱 / 分叉 / 环，不按时间戳猜序），仅重建成功时调用
     现有单链校验器，并返回每个事件的来源片段编号列表。"""
     return reconcile(request)
+
+
+@app.post(
+    "/api/v1/seal-chain/exposure-audit",
+    response_model=ExposureAuditResponse,
+    tags=["seal-chain"],
+    summary="开封暴露审计：授权窗口外的开封时长与分段",
+)
+def exposure_audit(request: ExposureAuditRequest) -> ExposureAuditResponse:
+    """复用单链校验器，仅用其中 status=ok 的 unseal/reseal 推导半开开封区间
+    [start,end)（末次未重封延伸到 audit_until）；先合并相交或首尾相接的允许
+    窗口，再对每段开封区间做区间差，返回 covered / uncovered 分段、未授权总
+    秒数及对应开封 / 重封事件下标。audit_until 早于最后一个有效事件时间返回 422。"""
+    try:
+        return audit_exposure(request)
+    except AuditParameterError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})

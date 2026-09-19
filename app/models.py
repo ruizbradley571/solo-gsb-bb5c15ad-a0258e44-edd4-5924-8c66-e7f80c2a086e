@@ -230,3 +230,84 @@ class ReconcileResponse(BaseModel):
         default_factory=list,
         description="每个 event_id 的来源片段编号列表，按首次出现顺序排列",
     )
+
+
+# ---------------------------------------------------------------------------
+# 开封暴露审计（/api/v1/seal-chain/exposure-audit）
+# ---------------------------------------------------------------------------
+
+
+class AllowedWindow(BaseModel):
+    """一个经授权的开封允许时间窗口（半开区间 [start, end)）。"""
+
+    start: datetime = Field(description="窗口起点（含）")
+    end: datetime = Field(description="窗口终点（不含），必须严格晚于 start")
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "AllowedWindow":
+        try:
+            invalid_order = self.start >= self.end
+        except TypeError:
+            raise ValueError("时间窗口时区信息不一致（不能混用带时区与不带时区的时间）")
+        if invalid_order:
+            raise ValueError("允许窗口的 start 必须严格早于 end")
+        return self
+
+
+class ExposureAuditRequest(BaseModel):
+    """开封暴露审计请求：事件链、审计截止时间与授权开封窗口。"""
+
+    events: List[Event] = Field(default_factory=list)
+    audit_until: datetime = Field(description="审计截止时间；末次开封未重封时开封区间延伸到该时刻")
+    allowed_windows: List[AllowedWindow] = Field(
+        default_factory=list,
+        description="经授权的开封允许窗口（半开 [start, end)，可乱序 / 相交 / 嵌套 / 首尾相接）",
+    )
+
+
+class ExposureInterval(BaseModel):
+    """由有效 unseal/reseal 事件推导出的一段半开开封区间 [start, end)。"""
+
+    start: datetime = Field(description="开封起点（有效 unseal 事件时间，含）")
+    end: datetime = Field(description="开封终点（有效 reseal 事件时间或 audit_until，不含）")
+    unseal_index: int = Field(description="开封事件在请求 events 中的下标（从 0 开始）")
+    reseal_index: Optional[int] = Field(
+        description="重封事件下标；末次开封未重封（延伸至 audit_until）时为 null"
+    )
+
+
+class ExposureSegment(BaseModel):
+    """一段开封区间与允许窗口做区间差后的结果分段。"""
+
+    start: datetime
+    end: datetime
+    seconds: int = Field(description="该分段时长（秒），end - start 向下取整")
+    unseal_index: int = Field(description="所属开封区间的开封事件下标")
+    reseal_index: Optional[int] = Field(
+        description="所属开封区间的重封事件下标；末次未重封时为 null"
+    )
+    window_index: Optional[int] = Field(
+        default=None,
+        description="covered 分段命中的合并后窗口下标（从 0 开始）；uncovered 分段为 null",
+    )
+
+
+class ExposureAuditResponse(BaseModel):
+    """开封暴露审计响应。"""
+
+    validation: ValidateResponse = Field(description="现有单链校验器的完整结果，结构保持不变")
+    audit_until: datetime = Field(description="回显审计截止时间")
+    exposure_intervals: List[ExposureInterval] = Field(
+        description="仅由 validation 中 status=ok 的 unseal/reseal 推导出的开封区间，按时间升序"
+    )
+    merged_windows: List[AllowedWindow] = Field(
+        default_factory=list,
+        description="合并相交或首尾相接窗口后的授权窗口，按 start 升序、互不相交"
+    )
+    covered: List[ExposureSegment] = Field(
+        default_factory=list, description="开封区间落在授权窗口内的分段，按时间升序"
+    )
+    uncovered: List[ExposureSegment] = Field(
+        default_factory=list, description="未授权开封分段，按时间升序"
+    )
+    uncovered_seconds: int = Field(description="未授权开封总秒数（各 uncovered 分段秒数之和）")
