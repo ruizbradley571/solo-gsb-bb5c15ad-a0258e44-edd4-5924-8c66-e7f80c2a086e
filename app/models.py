@@ -230,3 +230,69 @@ class ReconcileResponse(BaseModel):
         default_factory=list,
         description="每个 event_id 的来源片段编号列表，按首次出现顺序排列",
     )
+
+
+# ---------------------------------------------------------------------------
+# 开封暴露审计（/api/v1/seal-chain/exposure-audit）
+# ---------------------------------------------------------------------------
+
+
+class AllowedWindow(BaseModel):
+    """授权开窗窗口：半开时间区间 [start, end)，start 必须严格早于 end。"""
+
+    start: datetime = Field(description="窗口起点（含）")
+    end: datetime = Field(description="窗口终点（不含）")
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "AllowedWindow":
+        try:
+            start_before_end = self.start < self.end
+        except TypeError:
+            raise ValueError("窗口起止时间的时区信息不一致（不能混用带时区与不带时区的时间）")
+        if not start_before_end:
+            raise ValueError("allowed_windows 的 start 必须早于 end")
+        return self
+
+
+class ExposureAuditRequest(BaseModel):
+    """开封暴露审计请求：事件序列、审计截止时间与授权开窗窗口。"""
+
+    events: List[Event] = Field(default_factory=list)
+    audit_until: datetime = Field(description="审计截止时间；末次开封未重封时暴露区间延伸至此")
+    allowed_windows: List[AllowedWindow] = Field(
+        default_factory=list,
+        description="授权开窗窗口（半开 [start, end)），允许乱序、嵌套或首尾相接；"
+        "相交或首尾相接的窗口先合并再参与区间差",
+    )
+
+
+class ExposureSegment(BaseModel):
+    """一段（已覆盖或未覆盖的）半开时间区间 [start, end)。"""
+
+    start: datetime
+    end: datetime
+    seconds: float = Field(description="区间时长（秒），等于 end - start")
+    unseal_index: int = Field(description="产生该段的有效开封（unseal）事件下标（从 0 开始）")
+    reseal_index: Optional[int] = Field(
+        description="对应的有效重封（reseal）事件下标；末次开封未重封而延伸至 audit_until 时为 null"
+    )
+
+
+class ExposureAuditResponse(BaseModel):
+    """开封暴露审计响应：保留原单链校验结果，另附区间差明细。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 unseal/reseal 推导暴露区间"
+    )
+    covered: List[ExposureSegment] = Field(
+        default_factory=list,
+        description="落在授权窗口内的已覆盖分段（半开区间），按时间升序",
+    )
+    uncovered: List[ExposureSegment] = Field(
+        default_factory=list,
+        description="落在授权窗口外的未覆盖分段（半开区间），按时间升序",
+    )
+    unauthorized_seconds: float = Field(
+        default=0.0, description="未授权暴露总秒数，即全部 uncovered 分段秒数之和"
+    )

@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；并提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；并提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长。
 
 ## 校验规则（状态机）
 
@@ -287,6 +287,107 @@ curl -s http://localhost:8000/api/v1/seal-chain/reconcile-validate \
       ]}'
 ```
 
+### `POST /api/v1/seal-chain/exposure-audit`
+
+开封暴露审计。在单链状态机校验的基础上，回答“**展品处于开封状态的时间里，有多少落在授权开窗窗口之外**”。处理分四步：
+
+1. **调用现有单链校验器**，响应中原样保留 `validation`（结构同 `/validate`，含逐事件状态与违规明细）；
+2. **推导开封区间**：仅以 `validation.events` 中 `status = ok` 的 unseal / reseal 事件配对——有效 unseal 开启一个半开区间 `[start, end)`，其后第一个有效 reseal 将其闭合；末次开封后没有有效重封时，末点延伸至 `audit_until`（`audit_until` 恰好等于开封时间时退化为零长度区间，不计时长）。违规事件（包括状态机层面不合法的 unseal / reseal）一律忽略；
+3. **合并授权窗口**：`allowed_windows` 可乱序、嵌套；先按起点排序，再合并所有相交或首尾相接（`a.end == b.start`，半开区间下该点两侧均被覆盖）的窗口；
+4. **逐段做区间差**：对每段开封区间与合并后的窗口求差——落在窗口内的分段计入 `covered`，其余计入 `uncovered`；一段开封跨多个窗口时会被切成多段。全部分段按**时间升序**返回，并携带产生该段的有效开封 / 重封事件下标。
+
+- `audit_until`：审计截止时间（ISO 8601）。**早于最后一个有效事件时间时返回 `422`**（违规事件不推进有效时间基准）；恰好相等时允许。
+- `allowed_windows[]`：授权开窗窗口，`start` 必须严格早于 `end`（否则 `422`）；允许空列表，表示整段开封均未授权。窗口与事件时间戳不得混用带时区与不带时区的时间（否则 `422`）。
+- 链本身存在状态机违规**不影响**审计接口返回 `200`，违规情况仍只体现在 `validation` 中。
+
+**请求体**
+
+```json
+{
+  "events": [
+    {"type": "seal",   "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+    {"type": "unseal", "timestamp": "2026-09-18T11:00:00Z"},
+    {"type": "reseal", "timestamp": "2026-09-18T13:00:00Z", "seal_id": "S002", "custodian": "Alice"},
+    {"type": "unseal", "timestamp": "2026-09-18T16:00:00Z"}
+  ],
+  "audit_until": "2026-09-18T20:00:00Z",
+  "allowed_windows": [
+    {"start": "2026-09-18T12:00:00Z", "end": "2026-09-18T12:30:00Z"},
+    {"start": "2026-09-18T17:00:00Z", "end": "2026-09-18T19:00:00Z"}
+  ]
+}
+```
+
+**响应示例**（对应上例：两段开封分别为 `[11:00,13:00)` 与 `[16:00,20:00)`，末段未重封延伸至 `audit_until`）
+
+```json
+{
+  "audit_until": "2026-09-18T20:00:00Z",
+  "validation": {
+    "valid": true,
+    "sealed": false,
+    "final_custodian": "Alice",
+    "current_seal": null,
+    "events": [
+      {"index": 0, "type": "seal",   "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 1, "type": "unseal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 2, "type": "reseal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 3, "type": "unseal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+    ],
+    "violations": []
+  },
+  "covered": [
+    {"start": "2026-09-18T12:00:00Z", "end": "2026-09-18T12:30:00Z",
+     "seconds": 1800.0, "unseal_index": 1, "reseal_index": 2},
+    {"start": "2026-09-18T17:00:00Z", "end": "2026-09-18T19:00:00Z",
+     "seconds": 7200.0, "unseal_index": 3, "reseal_index": null}
+  ],
+  "uncovered": [
+    {"start": "2026-09-18T11:00:00Z", "end": "2026-09-18T12:00:00Z",
+     "seconds": 3600.0, "unseal_index": 1, "reseal_index": 2},
+    {"start": "2026-09-18T12:30:00Z", "end": "2026-09-18T13:00:00Z",
+     "seconds": 1800.0, "unseal_index": 1, "reseal_index": 2},
+    {"start": "2026-09-18T16:00:00Z", "end": "2026-09-18T17:00:00Z",
+     "seconds": 3600.0, "unseal_index": 3, "reseal_index": null},
+    {"start": "2026-09-18T19:00:00Z", "end": "2026-09-18T20:00:00Z",
+     "seconds": 3600.0, "unseal_index": 3, "reseal_index": null}
+  ],
+  "unauthorized_seconds": 12600.0
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `audit_until` | 回显请求中的审计截止时间 |
+| `validation` | 现有单链校验器的原始结果（结构同 `/validate`），审计仅采用其中 `status=ok` 的 unseal / reseal |
+| `covered[]` | 落在授权窗口内的已覆盖分段（半开 `[start, end)`），按时间升序 |
+| `uncovered[]` | 落在授权窗口外的未覆盖分段（半开 `[start, end)`），按时间升序 |
+| `covered/uncovered[].seconds` | 分段时长（秒），即 `end - start` |
+| `covered/uncovered[].unseal_index` | 产生该段的有效开封事件下标（从 0 开始） |
+| `covered/uncovered[].reseal_index` | 对应有效重封事件下标；末次开封未重封、区间延伸至 `audit_until` 时为 `null` |
+| `unauthorized_seconds` | 未授权暴露总秒数，等于全部 `uncovered` 分段秒数之和 |
+
+### 开封暴露审计接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/exposure-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+          {"type": "seal",
+           "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+          {"type": "unseal", "timestamp": "2026-09-18T11:00:00Z"},
+          {"type": "reseal",
+           "timestamp": "2026-09-18T13:00:00Z", "seal_id": "S002", "custodian": "Alice"}
+        ],
+        "audit_until": "2026-09-18T20:00:00Z",
+        "allowed_windows": [
+          {"start": "2026-09-18T12:30:00Z", "end": "2026-09-18T12:00:00Z"}
+        ]}'
+# start 晚于 end，返回 422
+```
+
+> 服务默认监听宿主机 **8000** 端口（容器内固定 `0.0.0.0:8000`，可用 `HOST_PORT` 覆盖），以上示例中的 `http://localhost:8000` 即该端口。
+
 ## 本地开发与测试
 
 ```bash
@@ -300,14 +401,16 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量与合并重建）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建与开封暴露审计）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
+  exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
 tests/
   test_validator.py
   test_batch.py
   test_reconcile.py
+  test_exposure.py
 Dockerfile
 docker-compose.yml
 requirements.txt
